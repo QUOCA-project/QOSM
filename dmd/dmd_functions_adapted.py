@@ -4,6 +4,7 @@ from scipy.signal import butter, filtfilt
 from matplotlib import pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
 from matplotlib import colors
+from pydmd import EDMD
 
 def hankelize(X2d, d):
     n_features, n_time = X2d.shape
@@ -812,6 +813,7 @@ def plot_reconstruction_summary(
     )
 
     return fig
+
 def plot_reconstruction_summary2(
     dmd,
     keep,
@@ -1096,6 +1098,1241 @@ def plot_reconstruction_summary2(
         colors=colors,
         cmap=cmap,
         normP=normP,
+    )
+
+    return fig, outputs
+
+
+def plot_reconstruction_summary3(
+    dmd,
+    keep,
+    delay,
+    dshape,
+    ds,
+    std_data,
+    stds,
+    u_levs,
+    T_levs=None,                 # optional so U-only calls work
+    qbo_band=(26, 30),
+    lat_band=(-10, 10),
+    pres_level=50.0,
+    title="DMD reconstruction summary",
+    return_outputs=False,
+    var_labels=None,             # <-- ONLY NEW CHANGE: lets you specify ["T"] for T-only
+):
+    """
+    Summary plot for a DMD reconstruction based on selected modes.
+    """
+
+    # -------------------------------------------------
+    # Indices and reconstruction
+    # -------------------------------------------------
+    lat = ds.lat.values
+    pres = ds.pres.values
+    # time = ds.time.values
+
+    lat_mask = (lat >= lat_band[0]) & (lat <= lat_band[1])
+    kpres = get_index(pres_level, pres)
+
+    X_rec = reconstruct_data(dmd, keep, delay, dshape)
+
+    # Undo standardisation
+    X_rec_phys = np.zeros_like(X_rec)
+    for v in range(X_rec.shape[0]):
+        X_rec_phys[v] = (X_rec[v].T / stds[v].T).T
+
+    # Input (ERA5) in physical units
+    X_in_phys = []
+    for v in range(X_rec.shape[0]):
+        Xin = (std_data[v].T / stds[v].T).T
+        X_in_phys.append(Xin)
+    X_in_phys = np.asarray(X_in_phys)
+
+    # -------------------------------------------------
+    # Fix model time axis issue
+    # -------------------------------------------------
+    dt = dmd.original_time["dt"]  # months per sample
+
+    ntime_rec = X_rec_phys.shape[-1]
+    ntime_in  = X_in_phys.shape[-1]
+    ntime = min(ntime_rec, ntime_in)
+
+    # truncate both so they match
+    X_rec_phys = X_rec_phys[..., :ntime]
+    X_in_phys  = X_in_phys[..., :ntime]
+
+    # robust plotting time axis: months since start (always works)
+    tplot = np.arange(ntime) * dt
+
+    # -------------------------------------------------
+    # Conjugate-pair decomposition for row 4
+    # -------------------------------------------------
+    keep_idx = np.where(keep)[0]
+    pairs, singles = find_conjugate_pairs(dmd.eigs[keep_idx])
+    structures = [(i, j) for (i, j) in pairs] + [(i,) for i in singles]
+
+    # -------------------------------------------------
+    # Colour by period (structure-level), used for rows 4 and 5
+    # -------------------------------------------------
+    lam_keep = np.asarray(dmd.eigs)[keep_idx]
+    theta_keep = np.angle(lam_keep)
+    freq_keep = np.abs(theta_keep) / (2*np.pi*dt)
+    period_keep = np.where(freq_keep > 0, 1.0/freq_keep, np.inf)
+
+    period_struct = np.array([period_keep[idx[0]] for idx in structures], dtype=float)
+
+    finite_p = np.isfinite(period_struct) & (period_struct > 0)
+    if np.any(finite_p):
+        p_lo = max(1e-3, np.nanpercentile(period_struct[finite_p], 1))
+        p_hi = np.nanpercentile(period_struct[finite_p], 99)
+    else:
+        p_lo, p_hi = 1e-3, 1.0
+
+    period_c = np.clip(np.where(np.isfinite(period_struct), period_struct, p_hi), p_lo, p_hi)
+    cmap = plt.cm.viridis
+    normP = LogNorm(vmin=p_lo, vmax=p_hi)
+    colors = cmap(normP(period_c))
+
+    # -------------------------------------------------
+    # Modal energy per structure split by variable (generic)
+    # State is stacked as [var0, var1, ...] for each delay block
+    # -------------------------------------------------
+    modes = np.asarray(dmd.modes)        # (n_state, n_modes)
+    dynamics = np.asarray(dmd.dynamics)  # (n_modes, n_time_eff)
+
+    nvar, npres, nlat, ntime0 = dshape
+    nstate_per_lag = nvar * npres * nlat
+    nmodes = modes.shape[1]
+
+    dyn_pow = np.mean(np.abs(dynamics)**2, axis=1)  # (nmodes,)
+
+    # reshape modes to (delay, nvar, npres, nlat, nmodes)
+    Phi = modes.reshape(delay, nstate_per_lag, nmodes).reshape(delay, nvar, npres, nlat, nmodes)
+
+    # variable norms per mode (sum over delay, pres, lat) -> (nvar, nmodes)
+    phi_var_norm2 = np.sum(np.abs(Phi)**2, axis=(0, 2, 3))  # (nvar, nmodes)
+
+    # energy per mode per var -> (nvar, nmodes)
+    energy_mode_var = phi_var_norm2 * dyn_pow[None, :]
+
+    # energy per structure per var -> (nvar, nstruct)
+    nstruct = len(structures)
+    energy_struct_var = np.zeros((nvar, nstruct), dtype=float)
+    for k, idx in enumerate(structures):
+        gi = keep_idx[list(idx)]
+        energy_struct_var[:, k] = np.sum(energy_mode_var[:, gi], axis=1)
+
+    # normalised energy for plotting -> (nvar, nstruct)
+    energy_plot = np.zeros_like(energy_struct_var)
+    for v in range(nvar):
+        s = np.sum(energy_struct_var[v])
+        energy_plot[v] = energy_struct_var[v] / s if s > 0 else energy_struct_var[v]
+
+    # -------------------------------------------------
+    # Figure layout (auto-detect nvar)
+    # -------------------------------------------------
+    fig = plt.figure(figsize=(12, 12), constrained_layout=True)
+
+    if nvar == 1:
+        axs = fig.subplot_mosaic(
+            """
+            A
+            C
+            E
+            G
+            I
+            """
+        )
+        row1_keys = ["A"]
+        row2_keys = ["C"]
+        row3_keys = ["E"]
+        row4_keys = ["G"]
+        row5_keys = ["I"]
+    else:
+        # preserves your exact original 2-col layout
+        axs = fig.subplot_mosaic(
+            """
+            AB
+            CD
+            EF
+            GH
+            IJ
+            """
+        )
+        row1_keys = ["A", "B"]
+        row2_keys = ["C", "D"]
+        row3_keys = ["E", "F"]
+        row4_keys = ["G", "H"]
+        row5_keys = ["I", "J"]
+
+    # ----------------------------
+    # ONLY CHANGE: reserve header space so suptitle and annotations don't overlap
+    # ----------------------------
+    fig.subplots_adjust(top=0.90)
+
+    # -------------------------------------------------
+    # Variable labels + contour levels (ONLY CHANGE HERE)
+    # -------------------------------------------------
+    if var_labels is None:
+        # Backwards-compatible defaults
+        if nvar == 2:
+            var_labels = ["u", "T"]
+        elif nvar == 1:
+            var_labels = ["u"]
+        else:
+            var_labels = [f"var{v}" for v in range(nvar)]
+    else:
+        if len(var_labels) != nvar:
+            raise ValueError(f"var_labels must have length {nvar}, got {len(var_labels)}")
+
+    # choose contour levels per var based on LABEL (fixes T-only case)
+    levs_list = []
+    for v in range(nvar):
+        lab = str(var_labels[v]).lower()
+        if lab == "t":
+            levs_list.append(T_levs if T_levs is not None else u_levs)
+        elif lab == "u":
+            levs_list.append(u_levs)
+        else:
+            levs_list.append(u_levs)
+
+    # -------------------------------------------------
+    # Plot rows
+    # -------------------------------------------------
+    t0 = None  # set from v==0 (peak of var0), as before
+
+    for v in range(nvar):
+        levs = levs_list[v]
+        Xr = X_rec_phys[v]
+        Xi = X_in_phys[v]
+
+        # ----------------------------
+        # Row 1: time vs pressure
+        # ----------------------------
+        ax = axs[row1_keys[v]]
+        trop_mean = Xr[:, lat_mask, :].mean(axis=1)
+
+        im = ax.contourf(tplot, pres, trop_mean, levels=levs, cmap="bwr", extend="both")
+        ax.set_yscale("log")
+        ax.invert_yaxis()
+        ax.set_title(f"{var_labels[v]}: tropical mean")
+
+        # ----------------------------
+        # Row 2: lat vs pressure snapshot at peak of var0
+        # ----------------------------
+        ax = axs[row2_keys[v]]
+        if v == 0:
+            t0 = np.argmax(np.abs(trop_mean[kpres]))
+        im = ax.contourf(lat, pres, Xr[:, :, t0], levels=levs, cmap="bwr", extend="both")
+        ax.set_yscale("log")
+        ax.invert_yaxis()
+        ax.set_title(f"{var_labels[v]}: structure at peak u")
+        fig.colorbar(im, ax=ax, orientation="horizontal")
+
+        # ----------------------------
+        # Row 3: time series comparison
+        # ----------------------------
+        ax = axs[row3_keys[v]]
+        ts_rec = Xr[kpres, lat_mask, :].mean(axis=0)
+        ts_in  = Xi[kpres, lat_mask, :].mean(axis=0)
+
+        ax.plot(tplot, ts_in, lw=2, color='b', label="Original data")
+        ax.plot(tplot, ts_rec, lw=2, color='r', label="Reconstruction")
+        r = np.corrcoef(ts_in, ts_rec)[0, 1]
+        ax.set_title(f"{var_labels[v]} @ {pres_level:.0f} hPa (r={r:.2f})")
+        ax.legend()
+
+        # ----------------------------
+        # Row 4: modal contributions (coloured by period)
+        # ----------------------------
+        ax = axs[row4_keys[v]]
+        for i, (idx, col) in enumerate(zip(structures, colors)):
+            gi = keep_idx[list(idx)]
+            H = (dmd.modes[:, gi] @ dmd.dynamics[gi, :]).real
+            try:
+                Xj = dehankel_embedded(H, delay, dshape)
+            except ValueError:
+                Xj = dehankel(H, delay, dshape)
+
+            Xj = (Xj[v].T / stds[v].T).T
+            ts = Xj[kpres, lat_mask, :].mean(axis=0)
+            ax.plot(tplot, ts, color=col, alpha=0.6, zorder=period_c[i])
+
+        ax.set_title(f"{var_labels[v]}: modal decomposition at {pres_level:.0f} hPa")
+
+        # ----------------------------
+        # Row 5: modal energy
+        # ----------------------------
+        ax = axs[row5_keys[v]]
+        y = energy_plot[v]
+
+        ax.scatter(period_c, y, c=period_c, cmap=cmap, norm=normP, s=35)
+        ax.set_title(f"{var_labels[v]}: modal energy")
+        ax.set_xlabel("Period (months)")
+        ax.set_ylabel("Modal energy fraction")
+        ax.set_yscale("log")
+        ax.set_ylim(1e-3, 1)
+        ax.grid(True, ls=":", lw=0.6, alpha=0.5)
+
+    # ----------------------------
+    # ONLY CHANGE: move suptitle + annotations into the reserved header band
+    # ----------------------------
+    fig.suptitle(title, y=0.975)
+
+    # --- QBO score (2D) annotations for each variable (tropics only) ---
+    mask_pres = np.ones_like(pres, dtype=bool)
+    w_use = None
+
+    scores = []
+    parts_list = []
+    for v in range(nvar):
+        score_v, parts_v = qbo_score_2d(
+            X_rec_phys[v][np.ix_(mask_pres, lat_mask, np.arange(ntime))],
+            X_in_phys[v][np.ix_(mask_pres, lat_mask, np.arange(ntime))],
+            lat=lat[lat_mask],
+            pres=pres[mask_pres],
+            dt=dt,
+            qbo_band=qbo_band,
+            weights=w_use,
+            dirichlet_gamma=1.0
+        )
+        scores.append(score_v)
+        parts_list.append(parts_v)
+
+    if nvar == 1:
+        v = 0
+        fig.text(
+            0.5, 0.94,
+            f"{var_labels[v]} score: {scores[v]:.3f}  (corr={parts_list[v]['corr_band']:.2f}, amp={parts_list[v]['amp_score']:.2f}, reg={parts_list[v]['regularity']:.2f})",
+            ha="center", va="top", fontsize="small"
+        )
+    else:
+        fig.text(
+            0.15, 0.94,
+            f"{var_labels[0]} score: {scores[0]:.3f}  (corr={parts_list[0]['corr_band']:.2f}, amp={parts_list[0]['amp_score']:.2f}, reg={parts_list[0]['regularity']:.2f})",
+            ha="center", va="top", fontsize="small"
+        )
+        if nvar >= 2:
+            fig.text(
+                0.85, 0.94,
+                f"{var_labels[1]} score: {scores[1]:.3f}  (corr={parts_list[1]['corr_band']:.2f}, amp={parts_list[1]['amp_score']:.2f}, reg={parts_list[1]['regularity']:.2f})",
+                ha="center", va="top", fontsize="small"
+            )
+
+    if not return_outputs:
+        return fig
+
+    # ----------------------------
+    # Outputs (extended)
+    # ----------------------------
+    amplitudes = getattr(dmd, "amplitudes", None)
+    omega = np.log(np.asarray(dmd.eigs)) / dt  # continuous-time eigenvalues (1/month)
+
+    outputs = dict(
+        X_rec_phys=X_rec_phys,
+        X_in_phys=X_in_phys,
+
+        tplot=tplot,
+        dt=dt,
+        ntime=ntime,
+
+        keep=keep,
+        keep_idx=keep_idx,
+        pairs=pairs,
+        singles=singles,
+        structures=structures,
+
+        lam_keep=lam_keep,
+        theta_keep=theta_keep,
+        freq_keep=freq_keep,
+        period_keep=period_keep,
+
+        period_struct=period_struct,
+        period_c=period_c,
+        colors=colors,
+        cmap=cmap,
+        normP=normP,
+
+        eigs=np.asarray(dmd.eigs),
+        omega=omega,
+        modes=np.asarray(dmd.modes),
+        dynamics=np.asarray(dmd.dynamics),
+        amplitudes=None if amplitudes is None else np.asarray(amplitudes),
+
+        energy_mode_var=energy_mode_var,
+        energy_struct_var=energy_struct_var,
+        energy_plot=energy_plot,
+
+        var_labels=var_labels,
+        levs_list=levs_list,
+        t0=t0,
+        lat_mask=lat_mask,
+        kpres=kpres,
+
+        qbo_scores=np.asarray(scores),
+        qbo_parts=parts_list,
+    )
+
+    return fig, outputs
+
+def compute_fft_summary(
+    ds,
+    input_vars,
+    p_band=(10.0, 100.0),
+    lat_band=slice(-10, 10),
+    dt=1.0,
+    xlim=(0, 50),
+    n_peaks=3,
+    var_labels=None,
+    var_units=None,
+    make_plots=True,
+    sort_pres=True,
+):
+
+    def area_weighted_trop_mean(_ds, var, _lat_band):
+        ds_trop = _ds.sel(lat=_lat_band)
+        if sort_pres and "pres" in ds_trop.coords:
+            ds_trop = ds_trop.sortby("pres")
+        wlat = np.cos(np.deg2rad(ds_trop["lat"]))
+        A = ds_trop[var].weighted(wlat).mean("lat").transpose("pres", "time")
+        return A
+
+    def bandmean_pres(A, _p_band):
+        pmin, pmax = _p_band
+        lo, hi = (pmin, pmax) if pmin < pmax else (pmax, pmin)
+        band = A.sel(pres=slice(lo, hi))
+        ts = band.mean("pres")
+        return ts, (lo, hi)
+
+    def detrend_1d(y):
+        y = np.asarray(y, float)
+        m = np.isfinite(y)
+        if m.sum() < 3:
+            return y * np.nan
+        x = np.arange(y.size)
+        p = np.polyfit(x[m], y[m], 1)
+        return y - (p[0] * x + p[1])
+
+    def fft_spectrum(y, _dt):
+        y = np.asarray(y, float)
+        m = np.isfinite(y)
+        if not np.all(m):
+            y = y[m]
+        n = y.size
+        if n < 3:
+            f = np.array([0.0])
+            amp = np.array([np.nan])
+            return f, amp
+
+        y = y - np.mean(y)
+        Y = np.fft.rfft(y)
+        f = np.fft.rfftfreq(n, d=_dt)
+        amp = (2.0 / n) * np.abs(Y)
+        amp[0] = amp[0] / 2.0
+        return f, amp
+
+    # Defaults for labels/units
+    var_labels = {} if var_labels is None else dict(var_labels)
+    var_units = {} if var_units is None else dict(var_units)
+
+    ft_results = {}
+
+    for var in input_vars:
+        # Robust: allow "T" vs "t" etc.
+        if var in ds.data_vars:
+            var_in_ds = var
+        elif var.lower() in ds.data_vars:
+            var_in_ds = var.lower()
+        elif var.upper() in ds.data_vars:
+            var_in_ds = var.upper()
+        else:
+            raise KeyError(
+                f"Variable '{var}' not found in ds.data_vars. "
+                f"Available: {list(ds.data_vars)}"
+            )
+
+        # 1) Tropical mean -> A(pres,time)
+        A = area_weighted_trop_mean(ds, var=var_in_ds, _lat_band=lat_band)
+
+        # 2) Optional pressure band mean -> ts(time)
+        if p_band is None:
+            ts = A.mean("pres")
+            psel = None
+        else:
+            ts, psel = bandmean_pres(A, _p_band=p_band)
+
+        # 3) Detrend + FFT
+        y = detrend_1d(ts.values)
+        f, amp = fft_spectrum(y, _dt=dt)
+
+        # 4) Convert to period for f>0
+        mask = f > 0
+        period = 1.0 / f[mask]
+        amps_pos = amp[mask]
+
+        # 5) Peaks
+        if amps_pos.size == 0 or not np.any(np.isfinite(amps_pos)):
+            peaks = np.array([])
+            peak_amps = np.array([])
+        else:
+            n = min(n_peaks, amps_pos.size)
+            top = np.argsort(amps_pos)[-n:]
+            top = top[np.argsort(amps_pos[top])[::-1]]  # descending
+            peaks = period[top]
+            peak_amps = amps_pos[top]
+
+        # Print summary (optional; remove if you want silent)
+        print(f"\n[{var}] using ds['{var_in_ds}']"
+              + (f" @ {psel} hPa" if psel is not None else ""))
+        for i, pk in enumerate(peaks, 1):
+            print(f"Peak {i}: {pk:.2f} (period units of dt)")
+
+        # 6) Plot
+        if make_plots and period.size:
+            label = var_labels.get(var, var_labels.get(var_in_ds, var))
+            units = var_units.get(var, var_units.get(var_in_ds, ""))
+
+            fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
+            ax.plot(period, amps_pos, label=f"{label}" + (f" @ {psel} hPa" if psel is not None else ""))
+            ax.invert_xaxis()
+            ax.set_xlabel("Period (time units of dt)")
+            ax.set_ylabel(f"FFT amplitude ({units})".rstrip().rstrip("()"))
+            ax.set_title(f"Tropical mean {label}: frequency decomposition")
+            ax.set_xlim(*xlim)
+            ax.grid(True, which="both", alpha=0.3)
+            ax.legend()
+            plt.show()
+
+        # Save everything useful
+        ft_results[var] = {
+            "var_in_ds": var_in_ds,
+            "psel": psel,
+            "f": f,
+            "amp": amp,
+            "period": period,
+            "amps_pos": amps_pos,
+            "peaks": peaks,
+            "peak_amps": peak_amps,
+            "ts": np.asarray(ts.values),
+        }
+
+    return ft_results
+
+def compute_eigenstructure_over_delays(
+    X2d,
+    stab_threshold,
+    d_multipliers,
+    qbo_period,
+    nlsa_kernel,
+    dt,
+    qbo_band,
+):
+
+    X_base = X2d.copy()
+    n_features = X_base.shape[0]
+
+    # build d_list exactly like your script
+    d_list_float = qbo_period * np.asarray(list(d_multipliers), dtype=float)
+    d_list = sorted(set(int(round(d)) for d in d_list_float))
+
+    eigenstructure = {}
+
+    for d in d_list:
+        # Delay embedding
+        print(f'Running DMD for d={d}')
+        H = hankelize(X_base, d)
+
+        edmd = EDMD(
+            svd_rank=-1,
+            kernel_metric=nlsa_kernel,
+            kernel_params={"epsilon": 2.0},
+        ).fit(H)
+
+        modes = edmd.modes
+        lam = np.asarray(edmd.eigs)
+
+        theta = np.angle(lam)
+        freq = np.abs(theta) / (2 * np.pi * dt)
+        period = np.where(freq > 0, 1.0 / freq, np.inf)
+
+        svalues = edmd.operator.svd_vals
+
+        qbo_mask = (
+            (period > qbo_band[0]) & (period < qbo_band[1]) &
+            (np.abs(np.abs(lam) - 1.0) < stab_threshold)
+        )
+        qbo_idx = np.where(qbo_mask)[0]
+
+        eigenstructure[d] = {
+            "lam": lam[qbo_idx],
+            "period": period[qbo_idx],
+            "phi0": modes[:n_features, qbo_idx],
+            "svalues": svalues,
+            "qbo_idx": qbo_idx,
+        }
+
+    return eigenstructure, d_list
+
+def select_delay_length(
+    eigenstructure,
+    d_list,
+    qbo_period,
+    annotate_fontsize=8,
+    scatter_size=40,
+    legend_loc="best",
+    figsize=(14, 6),
+):
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+
+    # ======================================================
+    # Plot 1: |lambda| vs d
+    # ======================================================
+    ax1 = axes[0]
+
+    for d in d_list:
+        lam = eigenstructure[d]["lam"]
+        per = eigenstructure[d]["period"]
+
+        if lam.size:
+            xvals = np.full(lam.size, d)
+            yvals = np.abs(lam)
+
+            ax1.scatter(xvals, yvals, s=scatter_size)
+
+            for x, y, p in zip(xvals, yvals, per):
+                ax1.annotate(
+                    f"{p:.1f}",
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(5, 5),
+                    fontsize=annotate_fontsize,
+                )
+    ax1.axhline(1,label="|lambda| = 1")
+    ax1.set_xlabel("delay embedding length d")
+    ax1.set_ylabel("|lambda|")
+    ax1.set_title("|lambda| vs d (labels = period)")
+    ax1.grid(True)
+    ax1.legend(loc=legend_loc)
+
+    # ======================================================
+    # Plot 2: period vs d
+    # ======================================================
+    ax2 = axes[1]
+
+    for d in d_list:
+        lam = eigenstructure[d]["lam"]
+        per = eigenstructure[d]["period"]
+
+        if per.size:
+            xvals = np.full(per.size, d)
+            yvals = per
+
+            ax2.scatter(xvals, yvals, s=scatter_size)
+
+            for x, y, l in zip(xvals, yvals, lam):
+                ax2.annotate(
+                    f"{np.abs(l):.3f}",
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(5, 5),
+                    fontsize=annotate_fontsize,
+                )
+
+    ax2.axhline(qbo_period,label=f"QBO period = {qbo_period:.1f}")
+    ax2.set_xlabel("delay embedding length d")
+    ax2.set_ylabel("period (time units of dt)")
+    ax2.set_title("Period vs d (labels = |lambda|)")
+    ax2.grid(True)
+    ax2.legend(loc=legend_loc)
+
+    plt.show()
+
+    # ======================================================
+    # Compute best_d
+    # ======================================================
+    best_d = min(
+        d_list,
+        key=lambda d: abs(
+            abs(
+                eigenstructure[d]["lam"][
+                    np.argmin(abs(eigenstructure[d]["period"] - qbo_period))
+                ]
+            ) - 1
+        )
+    )
+
+    return best_d
+
+def plot_mode_stability_across_d(
+    eigenstructure,
+    d_list,
+    ylim=(0.95, 1.05),
+    marker="o",
+    figsize=(8, 4),
+    title="Mode stability across d (lag-0 slice)",
+    eps=1e-12,
+):
+
+    def cos_sim(a, b):
+        # complex-safe cosine similarity, invariant to complex phase
+        num = np.abs(np.vdot(a, b))
+        den = (np.linalg.norm(a) * np.linalg.norm(b) + eps)
+        return num / den
+
+    def max_pairwise_similarity(PhiA, PhiB):
+        """
+        PhiA: (n_features, nA) columns are candidate phi0 vectors at d1
+        PhiB: (n_features, nB) columns are candidate phi0 vectors at d2
+        returns max cosine similarity over all column pairs
+        """
+        if PhiA.size == 0 or PhiB.size == 0:
+            return np.nan
+        best = -np.inf
+        for i in range(PhiA.shape[1]):
+            for j in range(PhiB.shape[1]):
+                s = cos_sim(PhiA[:, i], PhiB[:, j])
+                if s > best:
+                    best = s
+        return best
+
+    d_list = sorted(list(d_list))
+
+    sims = []
+    d_mid = []
+
+    for i in range(len(d_list) - 1):
+        d1, d2 = d_list[i], d_list[i + 1]
+        Phi1 = eigenstructure[d1]["phi0"]
+        Phi2 = eigenstructure[d2]["phi0"]
+        sims.append(max_pairwise_similarity(Phi1, Phi2))
+        d_mid.append(0.5 * (d1 + d2))
+
+    d_mid = np.asarray(d_mid, dtype=float)
+    sims = np.asarray(sims, dtype=float)
+
+    # Plot
+    plt.figure(figsize=figsize)
+    plt.plot(d_mid, sims, marker=marker)
+    plt.xlabel("midpoint delay length (d1+d2)/2")
+    plt.ylabel("max cosine similarity of phi0")
+    plt.title(title)
+    if ylim is not None:
+        plt.ylim(*ylim)
+    plt.grid(True)
+    plt.show()
+
+    return d_mid, sims
+
+def compute_spectral_entropy(svalues, crop_n=50, make_plots=True):
+
+    spectral_entropy = []
+
+    for r in range(1, len(svalues) - 1):
+        true_svalues = svalues[:r+1]
+        extended_svalues = np.append(true_svalues[:r], true_svalues[r-1])
+
+        p = true_svalues**2 / np.sum(true_svalues**2)
+        pi = extended_svalues**2 / np.sum(extended_svalues**2)
+
+        D_r = np.sum(p * np.log(p / pi))
+        spectral_entropy.append(D_r)
+
+    perc_total_entropy = np.cumsum(spectral_entropy) / np.sum(spectral_entropy)
+
+    if make_plots:
+
+        spectral_entropy_cropped = spectral_entropy[:crop_n]
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+
+        # ----------------------------------------
+        # Left: Spectral entropy (cropped)
+        # ----------------------------------------
+        axes[0].plot(
+            range(1, len(spectral_entropy_cropped) + 1),
+            spectral_entropy_cropped
+        )
+        axes[0].set_xlabel("svd_rank")
+        axes[0].set_ylabel("Spectral entropy D_r")
+        axes[0].set_title("Spectral entropy rank selection")
+        axes[0].grid(True)
+
+        # ----------------------------------------
+        # Right: Cumulative entropy
+        # ----------------------------------------
+        axes[1].plot(
+            range(1, len(perc_total_entropy) + 1),
+            perc_total_entropy
+        )
+        axes[1].set_xlabel("svd_rank")
+        axes[1].set_ylabel("% of total spectral entropy D_r")
+        axes[1].set_xlim(0, crop_n)
+        axes[1].set_title("Spectral entropy rank selection")
+        axes[1].grid(True)
+
+        plt.show()
+
+    return spectral_entropy
+
+def spectral_entropy_rank_truncation(spectral_entropy, alpha=0.001):
+
+    D = np.asarray(spectral_entropy)
+
+    print("\n--- KL-based rank selection ---")
+    print(f"Threshold alpha = {alpha*100:.1f}%\n")
+
+    if len(D) == 0 or np.sum(D) == 0:
+        print("KL sequence empty or zero — cannot select rank.")
+        return 1
+
+    # ---------------------------------------------------------
+    # OPTION A: Relative to peak KL so far
+    # D_r >= alpha * max(D_1 ... D_r)
+    # ---------------------------------------------------------
+    peak_so_far = np.maximum.accumulate(D)
+    keep_idx_A = np.where(D >= alpha * peak_so_far)[0]
+
+    r_A = keep_idx_A[-1] + 1 if len(keep_idx_A) else 1
+
+    print("Option A (relative to peak KL so far)")
+    print("Meaning: keep while incremental structural change")
+    print(f"         is at least {alpha*100:.1f}% of the largest change observed.")
+    print(f"Selected rank = {r_A}\n")
+
+    # ---------------------------------------------------------
+    # OPTION B: Cumulative KL mass
+    # sum(D_1..D_r) / sum(D) >= (1 - alpha)
+    # ---------------------------------------------------------
+    cdf = np.cumsum(D) / np.sum(D)
+    r_B = np.searchsorted(cdf, 1 - alpha) + 1
+
+    print("Option B (cumulative KL mass)")
+    print("Meaning: choose smallest rank capturing")
+    print(f"         {(1-alpha)*100:.1f}% of total structural change.")
+    print(f"Selected rank = {r_B}\n")
+
+    # ---------------------------------------------------------
+    # Final selection
+    # ---------------------------------------------------------
+    svd_rank = int(max(r_A, r_B))
+
+    print(f"Final selected svd_rank = {svd_rank}")
+
+    return svd_rank
+
+def plot_reconstruction_summary3_no_annual(
+    dmd,
+    keep,
+    delay,
+    dshape,
+    ds,
+    std_data,
+    stds,
+    u_levs,
+    T_levs=None,                 # optional so U-only calls work
+    qbo_band=(26, 30),
+    lat_band=(-10, 10),
+    pres_level=50.0,
+    title="DMD reconstruction summary",
+    return_outputs=False,
+    var_labels=None,             # <-- ONLY NEW CHANGE: lets you specify ["T"] for T-only
+):
+    """
+    Summary plot for a DMD reconstruction based on selected modes.
+
+    ONLY CHANGE vs your original:
+      - In Row 3 ONLY, for variable label exactly "T", the BLUE plotted
+        "Original data" line has its annual cycle removed (monthly climatology).
+      - All calculations (correlation r, QBO score, etc.) still use the
+        original unmodified data.
+    """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    # -------------------------------------------------
+    # Helper: remove monthly climatology from 1D monthly series
+    # (cosmetic: used ONLY for plotting blue line)
+    # -------------------------------------------------
+    def _remove_annual_cycle_1d_monthly(ts, time):
+        """
+        Subtracts monthly climatology from a 1D series (length ntime).
+        """
+        # Extract months robustly (works for cftime, pandas Timestamp, etc.)
+        months = np.array([getattr(t, "month", None) for t in time], dtype=object)
+        if np.all(months == None):
+            # numpy datetime64 fallback
+            tM = time.astype("datetime64[M]")
+            y = tM.astype("datetime64[Y]").astype(int) + 1970
+            m = (tM.astype(int) - (y - 1970) * 12) + 1
+            months = m.astype(int)
+        else:
+            months = months.astype(int)
+
+        out = ts.copy()
+        for mo in range(1, 13):
+            mask = (months == mo)
+            if np.any(mask):
+                out[mask] = out[mask] - np.mean(out[mask])
+        return out
+
+    # -------------------------------------------------
+    # Indices and reconstruction
+    # -------------------------------------------------
+    lat = ds.lat.values
+    pres = ds.pres.values
+    # time = ds.time.values
+
+    lat_mask = (lat >= lat_band[0]) & (lat <= lat_band[1])
+    kpres = get_index(pres_level, pres)
+
+    X_rec = reconstruct_data(dmd, keep, delay, dshape)
+
+    # Undo standardisation
+    X_rec_phys = np.zeros_like(X_rec)
+    for v in range(X_rec.shape[0]):
+        X_rec_phys[v] = (X_rec[v].T / stds[v].T).T
+
+    # Input (ERA5) in physical units
+    X_in_phys = []
+    for v in range(X_rec.shape[0]):
+        Xin = (std_data[v].T / stds[v].T).T
+        X_in_phys.append(Xin)
+    X_in_phys = np.asarray(X_in_phys)
+
+    # -------------------------------------------------
+    # Fix model time axis issue
+    # -------------------------------------------------
+    dt = dmd.original_time["dt"]  # months per sample
+
+    ntime_rec = X_rec_phys.shape[-1]
+    ntime_in  = X_in_phys.shape[-1]
+    ntime = min(ntime_rec, ntime_in)
+
+    # truncate both so they match
+    X_rec_phys = X_rec_phys[..., :ntime]
+    X_in_phys  = X_in_phys[..., :ntime]
+
+    # robust plotting time axis: months since start (always works)
+    tplot = np.arange(ntime) * dt
+
+    # -------------------------------------------------
+    # Conjugate-pair decomposition for row 4
+    # -------------------------------------------------
+    keep_idx = np.where(keep)[0]
+    pairs, singles = find_conjugate_pairs(dmd.eigs[keep_idx])
+    structures = [(i, j) for (i, j) in pairs] + [(i,) for i in singles]
+
+    # -------------------------------------------------
+    # Colour by period (structure-level), used for rows 4 and 5
+    # -------------------------------------------------
+    lam_keep = np.asarray(dmd.eigs)[keep_idx]
+    theta_keep = np.angle(lam_keep)
+    freq_keep = np.abs(theta_keep) / (2*np.pi*dt)
+    period_keep = np.where(freq_keep > 0, 1.0/freq_keep, np.inf)
+
+    period_struct = np.array([period_keep[idx[0]] for idx in structures], dtype=float)
+
+    finite_p = np.isfinite(period_struct) & (period_struct > 0)
+    if np.any(finite_p):
+        p_lo = max(1e-3, np.nanpercentile(period_struct[finite_p], 1))
+        p_hi = np.nanpercentile(period_struct[finite_p], 99)
+    else:
+        p_lo, p_hi = 1e-3, 1.0
+
+    period_c = np.clip(np.where(np.isfinite(period_struct), period_struct, p_hi), p_lo, p_hi)
+    cmap = plt.cm.viridis
+    normP = LogNorm(vmin=p_lo, vmax=p_hi)
+    colors = cmap(normP(period_c))
+
+    # -------------------------------------------------
+    # Modal energy per structure split by variable (generic)
+    # State is stacked as [var0, var1, ...] for each delay block
+    # -------------------------------------------------
+    modes = np.asarray(dmd.modes)        # (n_state, n_modes)
+    dynamics = np.asarray(dmd.dynamics)  # (n_modes, n_time_eff)
+
+    nvar, npres, nlat, ntime0 = dshape
+    nstate_per_lag = nvar * npres * nlat
+    nmodes = modes.shape[1]
+
+    dyn_pow = np.mean(np.abs(dynamics)**2, axis=1)  # (nmodes,)
+
+    # reshape modes to (delay, nvar, npres, nlat, nmodes)
+    Phi = modes.reshape(delay, nstate_per_lag, nmodes).reshape(delay, nvar, npres, nlat, nmodes)
+
+    # variable norms per mode (sum over delay, pres, lat) -> (nvar, nmodes)
+    phi_var_norm2 = np.sum(np.abs(Phi)**2, axis=(0, 2, 3))  # (nvar, nmodes)
+
+    # energy per mode per var -> (nvar, nmodes)
+    energy_mode_var = phi_var_norm2 * dyn_pow[None, :]
+
+    # energy per structure per var -> (nvar, nstruct)
+    nstruct = len(structures)
+    energy_struct_var = np.zeros((nvar, nstruct), dtype=float)
+    for k, idx in enumerate(structures):
+        gi = keep_idx[list(idx)]
+        energy_struct_var[:, k] = np.sum(energy_mode_var[:, gi], axis=1)
+
+    # normalised energy for plotting -> (nvar, nstruct)
+    energy_plot = np.zeros_like(energy_struct_var)
+    for v in range(nvar):
+        s = np.sum(energy_struct_var[v])
+        energy_plot[v] = energy_struct_var[v] / s if s > 0 else energy_struct_var[v]
+
+    # -------------------------------------------------
+    # Figure layout (auto-detect nvar)
+    # -------------------------------------------------
+    fig = plt.figure(figsize=(12, 12), constrained_layout=True)
+
+    if nvar == 1:
+        axs = fig.subplot_mosaic(
+            """
+            A
+            C
+            E
+            G
+            I
+            """
+        )
+        row1_keys = ["A"]
+        row2_keys = ["C"]
+        row3_keys = ["E"]
+        row4_keys = ["G"]
+        row5_keys = ["I"]
+    else:
+        # preserves your exact original 2-col layout
+        axs = fig.subplot_mosaic(
+            """
+            AB
+            CD
+            EF
+            GH
+            IJ
+            """
+        )
+        row1_keys = ["A", "B"]
+        row2_keys = ["C", "D"]
+        row3_keys = ["E", "F"]
+        row4_keys = ["G", "H"]
+        row5_keys = ["I", "J"]
+
+    # ----------------------------
+    # ONLY CHANGE (existing in your version): reserve header space
+    # ----------------------------
+    fig.subplots_adjust(top=0.90)
+
+    # -------------------------------------------------
+    # Variable labels + contour levels (ONLY CHANGE HERE)
+    # -------------------------------------------------
+    if var_labels is None:
+        # Backwards-compatible defaults
+        if nvar == 2:
+            var_labels = ["u", "T"]
+        elif nvar == 1:
+            var_labels = ["u"]
+        else:
+            var_labels = [f"var{v}" for v in range(nvar)]
+    else:
+        if len(var_labels) != nvar:
+            raise ValueError(f"var_labels must have length {nvar}, got {len(var_labels)}")
+
+    # choose contour levels per var based on LABEL (fixes T-only case)
+    levs_list = []
+    for v in range(nvar):
+        lab = str(var_labels[v]).lower()
+        if lab == "t":
+            levs_list.append(T_levs if T_levs is not None else u_levs)
+        elif lab == "u":
+            levs_list.append(u_levs)
+        else:
+            levs_list.append(u_levs)
+
+    # -------------------------------------------------
+    # Plot rows
+    # -------------------------------------------------
+    t0 = None  # set from v==0 (peak of var0), as before
+
+    for v in range(nvar):
+        levs = levs_list[v]
+        Xr = X_rec_phys[v]
+        Xi = X_in_phys[v]
+
+        # ----------------------------
+        # Row 1: time vs pressure
+        # ----------------------------
+        ax = axs[row1_keys[v]]
+        trop_mean = Xr[:, lat_mask, :].mean(axis=1)
+
+        im = ax.contourf(tplot, pres, trop_mean, levels=levs, cmap="bwr", extend="both")
+        ax.set_yscale("log")
+        ax.invert_yaxis()
+        ax.set_title(f"{var_labels[v]}: tropical mean")
+
+        # ----------------------------
+        # Row 2: lat vs pressure snapshot at peak of var0
+        # ----------------------------
+        ax = axs[row2_keys[v]]
+        if v == 0:
+            t0 = np.argmax(np.abs(trop_mean[kpres]))
+        im = ax.contourf(lat, pres, Xr[:, :, t0], levels=levs, cmap="bwr", extend="both")
+        ax.set_yscale("log")
+        ax.invert_yaxis()
+        ax.set_title(f"{var_labels[v]}: structure at peak u")
+        fig.colorbar(im, ax=ax, orientation="horizontal")
+
+        # ----------------------------
+        # Row 3: time series comparison
+        # ----------------------------
+        ax = axs[row3_keys[v]]
+        ts_rec = Xr[kpres, lat_mask, :].mean(axis=0)
+        ts_in  = Xi[kpres, lat_mask, :].mean(axis=0)
+
+        # --- ONLY NEW CHANGE: de-annualise the BLUE PLOT ONLY for Temperature ("T") ---
+        ts_in_plot = ts_in
+        if str(var_labels[v]) == "T":
+            time = ds.time.values[:ntime]  # aligned with truncation above
+            ts_in_plot = _remove_annual_cycle_1d_monthly(ts_in, time)
+
+        ax.plot(tplot, ts_in_plot, lw=2, color='b', label="Original data")
+        ax.plot(tplot, ts_rec,     lw=2, color='r', label="Reconstruction")
+
+        # IMPORTANT: correlation uses the ORIGINAL (non-deannualised) data
+        r = np.corrcoef(ts_in, ts_rec)[0, 1]
+        ax.set_title(f"{var_labels[v]} @ {pres_level:.0f} hPa (r={r:.2f})")
+        ax.legend()
+
+        # ----------------------------
+        # Row 4: modal contributions (coloured by period)
+        # ----------------------------
+        ax = axs[row4_keys[v]]
+        for i, (idx, col) in enumerate(zip(structures, colors)):
+            gi = keep_idx[list(idx)]
+            H = (dmd.modes[:, gi] @ dmd.dynamics[gi, :]).real
+            try:
+                Xj = dehankel_embedded(H, delay, dshape)
+            except ValueError:
+                Xj = dehankel(H, delay, dshape)
+
+            Xj = (Xj[v].T / stds[v].T).T
+            ts = Xj[kpres, lat_mask, :].mean(axis=0)
+            ax.plot(tplot, ts, color=col, alpha=0.6, zorder=period_c[i])
+
+        ax.set_title(f"{var_labels[v]}: modal decomposition at {pres_level:.0f} hPa")
+
+        # ----------------------------
+        # Row 5: modal energy
+        # ----------------------------
+        ax = axs[row5_keys[v]]
+        y = energy_plot[v]
+
+        ax.scatter(period_c, y, c=period_c, cmap=cmap, norm=normP, s=35)
+        ax.set_title(f"{var_labels[v]}: modal energy")
+        ax.set_xlabel("Period (months)")
+        ax.set_ylabel("Modal energy fraction")
+        ax.set_yscale("log")
+        ax.set_ylim(1e-3, 1)
+        ax.grid(True, ls=":", lw=0.6, alpha=0.5)
+
+    # ----------------------------
+    # Existing: move suptitle + annotations into the reserved header band
+    # ----------------------------
+    fig.suptitle(title, y=0.975)
+
+    # --- QBO score (2D) annotations for each variable (tropics only) ---
+    mask_pres = np.ones_like(pres, dtype=bool)
+    w_use = None
+
+    scores = []
+    parts_list = []
+    for v in range(nvar):
+        score_v, parts_v = qbo_score_2d(
+            X_rec_phys[v][np.ix_(mask_pres, lat_mask, np.arange(ntime))],
+            X_in_phys[v][np.ix_(mask_pres, lat_mask, np.arange(ntime))],
+            lat=lat[lat_mask],
+            pres=pres[mask_pres],
+            dt=dt,
+            qbo_band=qbo_band,
+            weights=w_use,
+            dirichlet_gamma=1.0
+        )
+        scores.append(score_v)
+        parts_list.append(parts_v)
+
+    if nvar == 1:
+        v = 0
+        fig.text(
+            0.5, 0.94,
+            f"{var_labels[v]} score: {scores[v]:.3f}  (corr={parts_list[v]['corr_band']:.2f}, amp={parts_list[v]['amp_score']:.2f}, reg={parts_list[v]['regularity']:.2f})",
+            ha="center", va="top", fontsize="small"
+        )
+    else:
+        fig.text(
+            0.15, 0.94,
+            f"{var_labels[0]} score: {scores[0]:.3f}  (corr={parts_list[0]['corr_band']:.2f}, amp={parts_list[0]['amp_score']:.2f}, reg={parts_list[0]['regularity']:.2f})",
+            ha="center", va="top", fontsize="small"
+        )
+        if nvar >= 2:
+            fig.text(
+                0.85, 0.94,
+                f"{var_labels[1]} score: {scores[1]:.3f}  (corr={parts_list[1]['corr_band']:.2f}, amp={parts_list[1]['amp_score']:.2f}, reg={parts_list[1]['regularity']:.2f})",
+                ha="center", va="top", fontsize="small"
+            )
+
+    if not return_outputs:
+        return fig
+
+    # ----------------------------
+    # Outputs (extended)
+    # ----------------------------
+    amplitudes = getattr(dmd, "amplitudes", None)
+    omega = np.log(np.asarray(dmd.eigs)) / dt  # continuous-time eigenvalues (1/month)
+
+    outputs = dict(
+        X_rec_phys=X_rec_phys,
+        X_in_phys=X_in_phys,
+
+        tplot=tplot,
+        dt=dt,
+        ntime=ntime,
+
+        keep=keep,
+        keep_idx=keep_idx,
+        pairs=pairs,
+        singles=singles,
+        structures=structures,
+
+        lam_keep=lam_keep,
+        theta_keep=theta_keep,
+        freq_keep=freq_keep,
+        period_keep=period_keep,
+
+        period_struct=period_struct,
+        period_c=period_c,
+        colors=colors,
+        cmap=cmap,
+        normP=normP,
+
+        eigs=np.asarray(dmd.eigs),
+        omega=omega,
+        modes=np.asarray(dmd.modes),
+        dynamics=np.asarray(dmd.dynamics),
+        amplitudes=None if amplitudes is None else np.asarray(amplitudes),
+
+        energy_mode_var=energy_mode_var,
+        energy_struct_var=energy_struct_var,
+        energy_plot=energy_plot,
+
+        var_labels=var_labels,
+        levs_list=levs_list,
+        t0=t0,
+        lat_mask=lat_mask,
+        kpres=kpres,
+
+        qbo_scores=np.asarray(scores),
+        qbo_parts=parts_list,
     )
 
     return fig, outputs

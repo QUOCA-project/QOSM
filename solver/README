@@ -1,4 +1,5 @@
-This folder contains firedrake setup and solver for the "simple model" for w (equaiton 6.1) 
+This folder contains firedrake setup. "simple_model" contains the solver for the "simple model" for w (equaiton 6.1). "streamfunc" contains the full solver.
+This code is IN DEVELOPMENT.
 Below are useful documents and instructions to setup firedrake locally: 
 
 Numerical Modeling with Firedrake 

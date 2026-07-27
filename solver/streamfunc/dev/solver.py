@@ -1,6 +1,4 @@
-"""Setup, ERA5 caching, and solving for the development streamfunction model."""
-
-from __future__ import annotations
+"""Setup, ERA5 caching, and solving for the streamfunction model."""
 
 from pathlib import Path
 
@@ -10,9 +8,11 @@ from scipy.interpolate import LinearNDInterpolator, RegularGridInterpolator, int
 from scipy.spatial import Delaunay
 
 try:
-    from . import config as default_config
-except ImportError:  # Allows ``python dev/solver.py``
-    import config as default_config
+    from . import settings
+except ImportError:  # Allows ``python solver/streamfunc/dev/solver.py``
+    import settings
+
+default_config = settings.load()
 
 
 SECONDS_PER_DAY = 24.0 * 3600.0
@@ -46,8 +46,8 @@ def calculate_era5_profile(source_path, gravity):
     source_path = Path(source_path)
     if not source_path.exists():
         raise FileNotFoundError(
-            f"ERA5 source file not found: {source_path}. "
-            "Set ERA5_SOURCE_PATH in dev/config.py."
+            f"ERA5 file not found: {source_path}. "
+            "Set ERA5_FILE in config.py."
         )
 
     with xr.open_dataset(source_path) as dataset:
@@ -84,22 +84,19 @@ def calculate_era5_profile(source_path, gravity):
 def load_era5_profile(profile_path):
     profile_path = Path(profile_path)
     if not profile_path.exists():
-        raise FileNotFoundError(
-            f"ERA5 profile cache not found: {profile_path}. "
-            "Set REBUILD_ERA5_PROFILE=True or provide the cached file."
-        )
+        raise FileNotFoundError(f"ERA5 profile cache not found: {profile_path}.")
     with xr.open_dataset(profile_path) as dataset:
         return dataset.load()
 
 
 def get_era5_profile(cfg):
-    profile_path = Path(cfg.ERA5_PROFILE_PATH)
-    if profile_path.exists() and not cfg.REBUILD_ERA5_PROFILE:
+    profile_path = Path(cfg.ERA5_CACHE_FILE)
+    if profile_path.exists() and not cfg.REBUILD_ERA5_CACHE:
         print(f"Loading cached ERA5 profile from {profile_path}")
         return load_era5_profile(profile_path)
 
-    print(f"Calculating ERA5 profile from {cfg.ERA5_SOURCE_PATH}")
-    profile = calculate_era5_profile(cfg.ERA5_SOURCE_PATH, cfg.GRAVITY)
+    print(f"Calculating ERA5 profile from {cfg.ERA5_FILE}")
+    profile = calculate_era5_profile(cfg.ERA5_FILE, cfg.GRAVITY)
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profile.to_netcdf(profile_path)
     print(f"Saved ERA5 profile to {profile_path}")
@@ -144,9 +141,10 @@ def numpy_to_function(data_2d, func, mesh, z, lat, y_nd_min, z_nd_min, y_ref, z_
 
 def config_attrs(cfg):
     names = [
+        "CONFIG_FILE",
         "RUN_NAME",
-        "ERA5_SOURCE_PATH",
-        "ERA5_PROFILE_PATH",
+        "ERA5_FILE",
+        "ERA5_CACHE_FILE",
         "Z_MIN",
         "Z_MAX",
         "DZ",
@@ -240,6 +238,7 @@ def write_output(dataset, output_file, compress=True):
 def run_simulation(cfg=default_config):
     import firedrake as fd
 
+    print(cfg.describe())
     era5_profile = get_era5_profile(cfg)
     z, lat = build_grid(cfg)
     times = build_times(cfg)

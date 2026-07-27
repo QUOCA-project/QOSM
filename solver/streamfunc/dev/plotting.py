@@ -1,6 +1,4 @@
-"""Plotting utilities for development streamfunction solver output."""
-
-from __future__ import annotations
+"""Plotting utilities for streamfunction solver output."""
 
 from pathlib import Path
 
@@ -9,11 +7,13 @@ import numpy as np
 import xarray as xr
 
 try:
-    from . import config as default_config
+    from . import settings
     from .solver import forcing
-except ImportError:  # Allows ``python dev/plotting.py``
-    import config as default_config
+except ImportError:  # Allows ``python solver/streamfunc/dev/plotting.py``
+    import settings
     from solver import forcing
+
+default_config = settings.load()
 
 
 SECONDS_PER_DAY = 24.0 * 3600.0

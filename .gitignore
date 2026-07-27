@@ -1,2 +1,7 @@
 .vscode/*
 .ipynb_checkpoints/*
+__pycache__/
+solver/streamfunc/dev/config_local.py
+solver/streamfunc/dev/runs/
+solver/streamfunc/dev/era5_cache/
+*.pyc
